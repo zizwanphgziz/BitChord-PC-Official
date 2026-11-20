@@ -19,6 +19,10 @@ use crate::stream::Format;
 /// build's own name goes first and the release line's is what a refusal falls back to.
 pub const USER_AGENT: &str = "Bitchord-PC";
 const RELEASE_AGENT: &str = "BitChord/v1.9.34";
+/// The hi-res addon this fork ships with: MadFLAC serves lossless FLAC from its own
+/// Tidal account. Seeded into the addon list on first run (see `main::seed_madflac`);
+/// the listener can remove or replace it like any other source.
+pub const MADFLAC_MANIFEST_URL: &str = "https://madflac.madvpn.dpdns.org:8443/manifest.json";
 /// Set once an addon has refused our own name: it keeps the release line's agent for the
 /// rest of the session instead of being refused on every request.
 static RELEASE_LINE: AtomicBool = AtomicBool::new(false);
@@ -102,6 +106,20 @@ impl Info {
         }
     }
 
+    /// The badge with the numbers that prove it: sample rate and bit depth when the
+    /// addon said what they are ("Lossless · 44.1 kHz · 16-bit"). Unknown numbers are
+    /// left out rather than guessed, so a bare badge is still the truth.
+    pub fn badge_line(&self) -> String {
+        let mut parts: Vec<String> = vec![self.badge().to_owned()];
+        if let Some(hz) = self.sample_rate.filter(|r| *r > 0) {
+            parts.push(fmt_khz(hz));
+        }
+        if let Some(bits) = self.bit_depth {
+            parts.push(format!("{bits}-bit"));
+        }
+        parts.join(" · ")
+    }
+
     /// The one-line audio-quality string the player's track-info and Discord both show:
     /// the badge, then each format detail that is known, joined with " · ".
     /// "Hi-Res Lossless · FLAC · 1641 kbps · 24-bit · 44.1 kHz · Stereo".
@@ -118,7 +136,7 @@ impl Info {
             parts.push(format!("{bits}-bit"));
         }
         if let Some(hz) = self.sample_rate.filter(|r| *r > 0) {
-            parts.push(if hz % 1000 == 0 { format!("{} kHz", hz / 1000) } else { format!("{:.1} kHz", hz as f64 / 1000.0) });
+            parts.push(fmt_khz(hz));
         }
         if let Some(n) = self.channels.filter(|c| *c > 0) {
             parts.push(match n {
@@ -154,6 +172,20 @@ impl Info {
     }
 }
 
+/// A sample rate in kHz: whole when it divides evenly, one decimal otherwise.
+fn fmt_khz(hz: u32) -> String {
+    if hz.is_multiple_of(1000) { format!("{} kHz", hz / 1000) } else { format!("{:.1} kHz", hz as f64 / 1000.0) }
+}
+
+/// How long a check or lookup took, as the settings row shows it.
+fn fmt_rtt(elapsed: Duration) -> String {
+    if elapsed < Duration::from_secs(1) {
+        format!("{} ms", elapsed.as_millis())
+    } else {
+        format!("{:.1} s", elapsed.as_secs_f32())
+    }
+}
+
 /// One playable answer from the addon.
 pub struct Stream {
     pub url: String,
@@ -174,6 +206,7 @@ pub struct Client {
 
 struct Manifest {
     name: Option<String>,
+    version: Option<String>,
     defaults: Vec<(String, String)>,
     quality: String,
 }
@@ -259,7 +292,7 @@ impl Client {
     async fn manifest(&self, http: &reqwest::Client) -> anyhow::Result<Manifest> {
         let mut slot = self.manifest.lock().await;
         if let Some(m) = slot.as_ref() {
-            return Ok(Manifest { name: m.name.clone(), defaults: m.defaults.clone(), quality: m.quality.clone() });
+            return Ok(Manifest { name: m.name.clone(), version: m.version.clone(), defaults: m.defaults.clone(), quality: m.quality.clone() });
         }
         let url = self.endpoint(&["manifest.json"], &[])?;
         let json = get_json(http, &url, REQUEST_TIMEOUT).await?;
@@ -268,9 +301,10 @@ impl Client {
         let resources: Vec<&str> = json.get("resources").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
         anyhow::ensure!(resources.is_empty() || resources.iter().any(|r| r.eq_ignore_ascii_case("search")), "the addon doesn't offer search");
         let name = json.get("name").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+        let version = json.get("version").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
         let (defaults, quality) = settings(json.get("settings"));
-        let manifest = Manifest { name, defaults, quality };
-        *slot = Some(Manifest { name: manifest.name.clone(), defaults: manifest.defaults.clone(), quality: manifest.quality.clone() });
+        let manifest = Manifest { name, version, defaults, quality };
+        *slot = Some(Manifest { name: manifest.name.clone(), version: manifest.version.clone(), defaults: manifest.defaults.clone(), quality: manifest.quality.clone() });
         Ok(manifest)
     }
 
@@ -534,8 +568,11 @@ fn usable(stream: &Stream) -> bool {
 /// What a pasted link really is, for the settings row that tests it: the addon's own name,
 /// the upstreams it lists, and what one of its lossless rows actually streams. A row can
 /// promise lossless and deliver 320 kbps, so the test opens one rather than trusting it.
+/// The summary also carries the addon's version (when it publishes one) and how long the
+/// test took, so the row reads as a health status: reachable, version, round-trip time.
 /// Neither the answer nor an error names the link: it carries a token.
 pub async fn check(http: &reqwest::Client, raw: &str) -> anyhow::Result<String> {
+    let started = std::time::Instant::now();
     let Some(client) = Client::new(raw) else { anyhow::bail!("that isn't an http(s) link") };
     let manifest = client.manifest(http).await?;
     let name = manifest.name.clone().unwrap_or_else(|| client.host());
@@ -550,7 +587,18 @@ pub async fn check(http: &reqwest::Client, raw: &str) -> anyhow::Result<String> 
     }
     let served = providers.join(", ");
     match client.open(http, &rows[0], false, false).await {
-        Ok(Some(s)) if usable(&s) => Ok(format!("{name} · {served} · plays {}", s.info.badge())),
+        Ok(Some(s)) if usable(&s) => {
+            let mut parts: Vec<String> = vec![name];
+            if let Some(version) = manifest.version.as_deref().filter(|v| !v.is_empty()) {
+                parts.push(format!("v{version}"));
+            }
+            if !served.is_empty() {
+                parts.push(served);
+            }
+            parts.push(format!("plays {}", s.info.badge()));
+            parts.push(fmt_rtt(started.elapsed()));
+            Ok(parts.join(" · "))
+        }
         Ok(Some(s)) => anyhow::bail!("{name} streamed {} where its row promised lossless", s.info.details_line()),
         Ok(None) => anyhow::bail!("{name} sent no stream for a test song"),
         Err(e) => anyhow::bail!("{name}: {e}"),
@@ -1173,6 +1221,30 @@ mod tests {
         // Without the preference the exact artist spelling still wins.
         let rows = vec![row("plain", "Carly Rae Jepsen", false), row("atmos", "Carly Jepsen", true)];
         assert_eq!(rank(rows, "Call Me Maybe", "Carly Rae Jepsen", Some(202), false)[0].id, "plain");
+    }
+
+    #[test]
+    fn the_badge_line_carries_the_numbers_when_they_are_known() {
+        let info = |codec: &str, rate: Option<u32>, bits: Option<u32>| Info {
+            source: "Addon".into(),
+            host: "example".into(),
+            codec: codec.into(),
+            quality: String::new(),
+            bitrate_kbps: None,
+            sample_rate: rate,
+            bit_depth: bits,
+            channels: None,
+            atmos: false,
+            size: 1,
+            duration_ms: 1,
+        };
+        assert_eq!(info("FLAC", Some(44_100), Some(16)).badge_line(), "Lossless · 44.1 kHz · 16-bit");
+        assert_eq!(info("FLAC", Some(96_000), Some(24)).badge_line(), "Hi-Res Lossless · 96 kHz · 24-bit");
+        assert_eq!(info("FLAC", Some(48_000), None).badge_line(), "Lossless · 48 kHz");
+        assert_eq!(info("FLAC", None, Some(24)).badge_line(), "Hi-Res Lossless · 24-bit");
+        assert_eq!(info("FLAC", None, None).badge_line(), "Lossless");
+        assert_eq!(info("MP3", None, None).badge_line(), "High");
+        assert_eq!(info("FLAC", Some(88_200), Some(24)).badge_line(), "Hi-Res Lossless · 88.2 kHz · 24-bit");
     }
 
     #[test]

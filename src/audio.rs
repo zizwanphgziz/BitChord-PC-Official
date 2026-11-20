@@ -41,6 +41,10 @@ pub enum AudioCmd {
     /// Play through this device (cpal's id) whenever it's connected; None follows the
     /// system default.
     SetDevice(Option<String>),
+    /// Playback speed, 0.5–2×. Applies to the current track at once (rodio's
+    /// `Player::set_speed` re-factors the running source within milliseconds)
+    /// and to every player started after it.
+    SetSpeed(f32),
 }
 
 pub enum AudioEvent {
@@ -73,6 +77,18 @@ pub struct AudioStatus {
     pub wanted_gen: AtomicU64,
     /// f32 bits
     volume: AtomicU32,
+    /// Playback speed 0.5–2× (f32 bits); 1.0 is normal. rodio's `Speed` wrapper
+    /// raises the pitch with the tempo (it plays the samples faster), so this is
+    /// a tempo control, not time-stretching.
+    speed: AtomicU32,
+    /// The output sample rate picked in Settings (Hz); 0 = the device's default.
+    /// Startup-only: the mixer is built once with it, so a new pick needs a
+    /// restart to take effect. Kept here (not in `App`) so Settings can read and
+    /// save it without a new field.
+    sample_rate_pref: AtomicU32,
+    /// The rate the mixer actually runs at this launch (Hz); 0 = the device's
+    /// default. Settings compares it with the pick to offer a restart.
+    sample_rate_active: AtomicU32,
     /// Turn loud tracks down to YouTube's loudness target.
     pub normalize: AtomicBool,
     /// The volume slider follows loudness (cubic) rather than amplitude.
@@ -584,6 +600,37 @@ impl AudioHandle {
         self.status.crossfade_ms.store(secs * 1000, Ordering::Relaxed);
     }
 
+    /// Playback speed, 0.5–2×. Applies to the current track at once and to every
+    /// track after it; the pitch rises with the tempo (rodio plays the samples
+    /// faster, it does not time-stretch).
+    pub fn speed(&self) -> f32 {
+        f32::from_bits(self.status.speed.load(Ordering::Relaxed))
+    }
+
+    pub fn set_speed(&self, v: f32) {
+        let v = clamp_speed(v);
+        self.status.speed.store(v.to_bits(), Ordering::Relaxed);
+        self.send(AudioCmd::SetSpeed(v));
+    }
+
+    /// The output sample rate picked in Settings (Hz); None is the device's
+    /// default. Startup-only: the mixer is built once with it at launch, so a
+    /// new pick needs a restart to take effect (the Settings row says so).
+    pub fn sample_rate_pref(&self) -> Option<u32> {
+        let r = self.status.sample_rate_pref.load(Ordering::Relaxed);
+        (r > 0).then_some(r)
+    }
+
+    pub fn set_sample_rate_pref(&self, rate: Option<u32>) {
+        self.status.sample_rate_pref.store(rate.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// The rate the mixer runs at this launch (Hz); None is the device's default.
+    pub fn sample_rate_active(&self) -> Option<u32> {
+        let r = self.status.sample_rate_active.load(Ordering::Relaxed);
+        (r > 0).then_some(r)
+    }
+
     /// Automix's handoff shape for the crossfade (see `Ramp::MixIn`).
     pub fn set_automix(&self, on: bool) {
         self.status.automix.store(on, Ordering::Relaxed);
@@ -703,6 +750,15 @@ fn mix_ms(status: &AudioStatus, length: Option<Duration>) -> u32 {
     length.map_or(ms, |d| ms.min((d.as_millis() as u32 / 3).max(QUICK_FADE_MS)))
 }
 
+/// The speed presets the Settings row offers, and the range `set_speed` clamps to.
+/// Outside it rodio would still play, but slower than half speed is unusable and
+/// faster than double is chipmunk territory.
+pub const SPEED_PRESETS: [f32; 6] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+
+pub fn clamp_speed(v: f32) -> f32 {
+    if v.is_finite() { v.clamp(0.5, 2.0) } else { 1.0 }
+}
+
 /// Gain for a volume slider position. Ears hear amplitude roughly logarithmically,
 /// so on a linear slider nearly all the change is in its bottom few pixels; the cubic
 /// curve (PulseAudio's) spreads it out: half way is -18 dB.
@@ -730,20 +786,31 @@ struct Output {
     device: Option<String>,
     /// The device the user picked; the default stands in while it's not connected.
     preferred: Option<String>,
+    /// The sample rate the mixer (and the sink) run at. The listener's pick when
+    /// the device supports it, else the device's default rate. Fixed for the
+    /// run: the mixer is built once with it, so a new pick needs a restart.
+    rate: u32,
     /// Set by the device's error callback.
     lost: Arc<AtomicBool>,
     checked: Instant,
 }
 
 impl Output {
-    fn new(tx: Sender<AudioCmd>, status: &AudioStatus, preferred: Option<String>) -> Self {
+    fn new(tx: Sender<AudioCmd>, status: &AudioStatus, preferred: Option<String>, sample_rate: Option<u32>) -> Self {
         // Mix at the device's own format, so the usual case needs no conversion.
-        let config = target(preferred.as_deref()).and_then(|d| d.default_output_config().ok());
+        // A picked rate the device supports (e.g. 96 kHz for a USB DAC) mixes at
+        // that rate instead, so hi-res tracks reach the device unresampled; the
+        // sink is opened at the same rate (see `open`).
+        let device = target(preferred.as_deref());
+        let config = device.as_ref().and_then(|d| d.default_output_config().ok());
+        let rate = sample_rate
+            .filter(|&r| device.as_ref().is_some_and(|d| device_supports_rate(d, r)))
+            .unwrap_or_else(|| config.as_ref().map_or(48_000, |c| c.sample_rate()));
         let channels = config.as_ref().and_then(|c| std::num::NonZero::new(c.channels())).unwrap_or(std::num::NonZero::new(2).unwrap());
-        let rate = config.as_ref().and_then(|c| std::num::NonZero::new(c.sample_rate())).unwrap_or(std::num::NonZero::new(48_000).unwrap());
+        let rate = std::num::NonZero::new(rate).unwrap_or(std::num::NonZero::new(48_000).unwrap());
         let (mixer, source) = rodio::mixer::mixer(channels, rate);
         let lost = Arc::new(AtomicBool::new(false));
-        let mut out = Self { mixer, slot: Arc::new(std::sync::Mutex::new(Some(source))), sink: None, device: None, preferred, lost, checked: Instant::now() };
+        let mut out = Self { mixer, slot: Arc::new(std::sync::Mutex::new(Some(source))), sink: None, device: None, preferred, rate: rate.get(), lost, checked: Instant::now() };
         out.open(tx, status);
         out
     }
@@ -766,7 +833,13 @@ impl Output {
                 let _ = tx.send(AudioCmd::DeviceLost);
             }
         };
-        let sink = match DeviceSinkBuilder::from_device(device).and_then(|b| b.with_error_callback(on_error).open_sink_or_fallback()) {
+        let sink = match DeviceSinkBuilder::from_device(device).and_then(|b| {
+            // Ask for the mixer's rate, so the sink's own mixer doesn't resample
+            // what ours just mixed. A device that refuses it falls back through
+            // its supported configs (`open_sink_or_fallback`); the log line below
+            // says what actually opened.
+            b.with_sample_rate(std::num::NonZero::new(self.rate).unwrap()).with_error_callback(on_error).open_sink_or_fallback()
+        }) {
             Ok(s) => s,
             Err(e) => {
                 log::warn!("audio: couldn't open the output device: {e}");
@@ -830,6 +903,25 @@ pub struct OutputDevice {
     /// cpal's id: stable across reconnects.
     pub id: String,
     pub name: String,
+}
+
+/// Whether the device can run at `rate`: some supported config covers it. cpal
+/// reports ranges, not a list, so a DAC that takes 44.1–192 kHz accepts every
+/// rate in between; the Settings row still only offers the usual ones.
+fn device_supports_rate(device: &rodio::cpal::Device, rate: u32) -> bool {
+    device.supported_output_configs().is_ok_and(|mut all| all.any(|r| rate >= r.min_sample_rate() && rate <= r.max_sample_rate()))
+}
+
+/// The sample rates the picked (or default) device offers, for the Settings row.
+/// rodio's helper returns one concrete config per range (its max, 44.1 kHz when
+/// inside the range, its min), so this is the device's real rates, deduplicated.
+pub fn supported_rates(preferred: Option<&str>) -> Vec<u32> {
+    let Some(device) = target(preferred) else { return Vec::new() };
+    let Ok(configs) = rodio::stream::supported_output_configs(&device) else { return Vec::new() };
+    let mut rates: Vec<u32> = configs.map(|c| c.sample_rate()).collect();
+    rates.sort_unstable();
+    rates.dedup();
+    rates
 }
 
 /// The connected output devices, by the names Windows' sound settings show.
@@ -897,17 +989,23 @@ impl Drop for Bridge {
 /// How often to look for a new default device while playing.
 const DEVICE_CHECK: Duration = Duration::from_secs(1);
 
-pub fn spawn(volume: f32, log_volume: bool, device: Option<String>, events: Sender<AudioEvent>, wake: impl Fn() + Send + 'static) -> AudioHandle {
+/// `sample_rate`: the mixer's rate in Hz when the device supports it (Settings ›
+/// Playback › Output sample rate); None mixes at the device's default rate.
+pub fn spawn(volume: f32, log_volume: bool, device: Option<String>, sample_rate: Option<u32>, events: Sender<AudioEvent>, wake: impl Fn() + Send + 'static) -> AudioHandle {
     let (tx, rx) = unbounded();
     let status = Arc::new(AudioStatus::default());
     status.volume.store(volume.to_bits(), Ordering::Relaxed);
     status.log_volume.store(log_volume, Ordering::Relaxed);
+    status.speed.store(1.0f32.to_bits(), Ordering::Relaxed);
+    // The pick and the running rate start the same; Settings moves only the pick.
+    status.sample_rate_pref.store(sample_rate.unwrap_or(0), Ordering::Relaxed);
+    status.sample_rate_active.store(sample_rate.unwrap_or(0), Ordering::Relaxed);
     let st = status.clone();
     std::thread::Builder::new()
         .name("audio".into())
         .spawn({
             let tx = tx.clone();
-            move || run(rx, tx, st, volume, device, events, wake)
+            move || run(rx, tx, st, volume, device, sample_rate, events, wake)
         })
         .expect("spawn audio thread");
     AudioHandle { tx, status }
@@ -919,15 +1017,20 @@ fn run(
     status: Arc<AudioStatus>,
     volume: f32,
     device: Option<String>,
+    sample_rate: Option<u32>,
     events: Sender<AudioEvent>,
     wake: impl Fn(),
 ) {
-    let mut output = Output::new(tx.clone(), &status, device);
+    let mut output = Output::new(tx.clone(), &status, device, sample_rate);
     if output.sink.is_none() {
         let _ = events.send(AudioEvent::Error("No audio output device".into()));
         wake();
     }
     let mut player = Player::connect_new(&output.mixer);
+    // Playback speed, kept for every player this loop starts (a handoff or an
+    // upgrade swaps the player, and a fresh one starts at 1.0).
+    let mut speed = clamp_speed(f32::from_bits(status.speed.load(Ordering::Relaxed)));
+    player.set_speed(speed);
     player.set_volume(slider_gain(&status, volume));
     // The playing source's fade-out control (see `Meter`).
     let mut fade_out = Arc::new(AtomicU32::new(0));
@@ -1049,6 +1152,7 @@ fn run(
                 if !paused && !player.empty() {
                     fade_out.store(QUICK_FADE_MS, Ordering::Relaxed);
                     let old = std::mem::replace(&mut player, Player::connect_new(&output.mixer));
+                    player.set_speed(speed);
                     fading.push(Fading { player: old, offset, shared: shared.take(), out: fade_out.clone(), waiting: None, natural: false });
                 } else {
                     player.clear();
@@ -1111,6 +1215,7 @@ fn run(
                 let left = length.map(|d| d.saturating_sub(offset + player.get_pos()));
                 log::debug!("audio: handing off from generation {current}, {left:?} left");
                 let old = std::mem::replace(&mut player, Player::connect_new(&output.mixer));
+                player.set_speed(speed);
                 fading.push(Fading { player: old, offset, shared: shared.take(), out: fade_out.clone(), waiting: Some((Instant::now(), left)), natural: ending_sent });
                 current = 0;
                 status.playing_gen.store(0, Ordering::Relaxed);
@@ -1130,6 +1235,7 @@ fn run(
                     if current != 0 && !player.is_paused() && !player.empty() {
                         fade_out.store(QUICK_FADE_MS, Ordering::Relaxed);
                         let old = std::mem::replace(&mut player, Player::connect_new(&output.mixer));
+                        player.set_speed(speed);
                         fading.push(Fading { player: old, offset, shared: shared.take(), out: fade_out.clone(), waiting: None, natural: false });
                     } else {
                         player.clear();
@@ -1218,6 +1324,17 @@ fn run(
                     output.open(tx.clone(), &status);
                 }
             }
+            Ok(AudioCmd::SetSpeed(v)) => {
+                // rodio applies it to the running source within milliseconds (the
+                // player's 5 ms callback re-factors the `Speed` wrapper), so the
+                // song playing now changes speed at once; the tail fading under a
+                // crossfade takes it too, so the blend stays in step.
+                speed = v;
+                player.set_speed(v);
+                for f in &fading {
+                    f.player.set_speed(v);
+                }
+            }
             Ok(AudioCmd::Volume(v)) => {
                 let v = slider_gain(&status, v);
                 player.set_volume(v * norm_gain(&status, shared.as_deref()));
@@ -1272,14 +1389,29 @@ fn run(
                 log::debug!("audio: crossfade done");
             }
         }
+        // The sleep timer's backstop: the UI tick normally fires it (see
+        // `App::tick_sleep_timer`), but this loop is awake every 100 ms while a
+        // song plays, so a missed UI tick still pauses on time. `take_due` is
+        // one-shot, so whichever side fires first is the only one that does.
+        // `take_due` last: a timer that runs out while paused stays armed and
+        // fires as soon as playback resumes.
+        if current != 0 && !player.is_paused() && crate::sleep_timer::take_due() {
+            log::info!("audio: sleep timer fired, pausing");
+            player.pause();
+            fading.iter().for_each(|f| f.player.pause());
+            status.playing.store(false, Ordering::Relaxed);
+            wake();
+        }
         if current != 0 {
             let pos = offset + player.get_pos();
             status.set_position(pos.as_millis() as u64);
             // Start the next song early, to crossfade into it. Not for songs barely
-            // longer than the fade.
+            // longer than the fade. Not while "stop after this track" is armed: the
+            // next song must not start before this one ends.
             let crossfade = Duration::from_millis(mix_ms(&status, length) as u64);
             if !ending_sent
                 && !crossfade.is_zero()
+                && !crate::sleep_timer::after_track_armed()
                 && let Some(d) = length
                 && d > crossfade * 2
                 && pos + crossfade >= d
@@ -1294,7 +1426,12 @@ fn run(
                 // A failed download ends the decoder early: that's not the song ending.
                 let event = match shared.as_ref().and_then(|s| s.error()) {
                     Some(reason) => AudioEvent::Interrupted { generation: current, at: offset + player.get_pos(), reason },
-                    None => AudioEvent::Finished { generation: current },
+                    // A natural end with "stop after this track" armed: the UI
+                    // consumes the flag instead of advancing the queue.
+                    None => {
+                        crate::sleep_timer::arm_stop_pending();
+                        AudioEvent::Finished { generation: current }
+                    }
                 };
                 let _ = events.send(event);
                 current = 0;
@@ -1579,5 +1716,27 @@ mod tests {
         assert!((audio.volume() - 0.5).abs() < 1e-6);
         audio.set_log_volume(false);
         assert!((audio.volume() - 0.125).abs() < 1e-6);
+    }
+
+    #[test]
+    fn speed_is_clamped_to_the_offered_range() {
+        assert_eq!(clamp_speed(1.0), 1.0);
+        assert_eq!(clamp_speed(0.75), 0.75);
+        assert_eq!(clamp_speed(0.1), 0.5);
+        assert_eq!(clamp_speed(4.0), 2.0);
+        assert_eq!(clamp_speed(f32::NAN), 1.0);
+        assert_eq!(clamp_speed(f32::INFINITY), 1.0);
+        assert_eq!(SPEED_PRESETS, [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]);
+    }
+
+    #[test]
+    fn set_speed_stores_it_and_sends_the_command() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let audio = AudioHandle { tx, status: Arc::new(AudioStatus::default()) };
+        audio.set_speed(1.5);
+        assert_eq!(audio.speed(), 1.5);
+        assert!(matches!(rx.try_recv(), Ok(AudioCmd::SetSpeed(v)) if v == 1.5));
+        audio.set_speed(9.0);
+        assert_eq!(audio.speed(), 2.0, "out of range is clamped, not stored raw");
     }
 }

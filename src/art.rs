@@ -118,3 +118,20 @@ pub fn idle() -> Art {
     }
     Art { rgba, accent: Color32::from_rgb(0xff, 0x4e, 0x6a) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accent_follows_the_cover_colour() {
+        // A solid red cover: the accent must be red, not the default.
+        let img = image::RgbImage::from_pixel(64, 64, image::Rgb([200, 30, 40]));
+        let accent = palette(&img);
+        assert!(accent.r() > 150 && accent.g() < 100, "{accent:?}");
+        // Greyscale: no vivid colour, so the average (a lifted grey) wins.
+        let grey = image::RgbImage::from_pixel(64, 64, image::Rgb([120, 120, 120]));
+        let accent = palette(&grey);
+        assert!(accent.r() > 100 && accent.g() > 100, "{accent:?}");
+    }
+}

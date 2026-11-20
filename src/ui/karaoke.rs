@@ -185,7 +185,7 @@ impl Cfg {
         self.active_scale.max(self.css.as_ref().and_then(|c| c.hover_scale).unwrap_or(1.0)).max(1.0)
     }
 
-    fn new(s: &LyricStyle, accent: Color32, width: f32, viewport: f32, centered: bool, scale: f32) -> Self {
+    fn new(s: &LyricStyle, accent: Color32, width: f32, viewport: f32, centered: bool, scale: f32, word_timed: bool) -> Self {
         let css = s.css.clone();
         // Font size and rem: a theme's own `--blyrics-font-size` steps in YouTube Music's
         // 10 px rem; otherwise 48 pt scaled by the preset with the extension's proportions.
@@ -243,7 +243,12 @@ impl Cfg {
             padding: rem * 2.0 * (s.line_gap / 0.6).clamp(0.2, 3.0),
             target_ratio: s.anchor.clamp(0.1, 0.7),
             centered,
-            fill: s.fill,
+            // The listener's highlight pick (Settings › Lyrics) wins over the
+            // theme's fill: Automatic lights each word when the lyrics carry word
+            // timing and the whole line when they don't; an explicit pick is
+            // honoured, with word-by-word falling back to the line on line-only
+            // lyrics. The theme's fill is what shows before any prefs load.
+            fill: crate::ui::lyric_prefs::highlight_current().fill(word_timed),
             wave_crest: crest,
             wave_settle: settle,
             emphasis: wave[3],
@@ -867,7 +872,7 @@ impl View {
         let rect = f.rect;
         let ctx = ui.ctx().clone();
         self.shown_pass = ctx.cumulative_pass_nr();
-        let cfg = Cfg::new(f.style, f.accent, rect.width(), ctx.content_rect().width(), f.centered, f.scale);
+        let cfg = Cfg::new(f.style, f.accent, rect.width(), ctx.content_rect().width(), f.centered, f.scale, f.lyrics.sync == Sync::Word);
         let layout_key = hash((f.key, rect.width().round() as i32, cfg.size.to_bits(), cfg.padding.to_bits(), cfg.max_scale().to_bits(), cfg.centered, &cfg.font, cfg.weight as u8));
         if self.layout.as_ref().is_none_or(|l| l.key != layout_key) {
             self.relayout(ui, &cfg, &f, layout_key, rect);

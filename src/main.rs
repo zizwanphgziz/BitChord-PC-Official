@@ -20,7 +20,9 @@ mod jam;
 mod innertube;
 mod jsc;
 mod lastfm;
+mod listenbrainz;
 mod login;
+mod locallib;
 mod lyrics;
 mod media;
 mod model;
@@ -28,6 +30,7 @@ mod motion;
 mod opus;
 mod preset;
 mod shader;
+mod sleep_timer;
 mod sponsorblock;
 mod stream;
 mod theme;
@@ -101,6 +104,10 @@ fn main() -> eframe::Result {
         viewport = viewport.with_position([-4000.0, 0.0]).with_inner_size([1920.0, 1057.0]).with_active(false).with_taskbar(false);
     }
     let renderer = renderer::init(&data_dir());
+    // First run: the hi-res addon list starts with MadFLAC (see `seed_madflac`).
+    // This runs before eframe loads its settings, which this process only ever
+    // gets a shared reference to.
+    seed_madflac(&data_dir());
     let options = eframe::NativeOptions {
         viewport,
         renderer: match renderer {
@@ -160,9 +167,12 @@ fn main() -> eframe::Result {
             let volume = if std::env::var_os("YTM_MUTE").is_some() { 0.0 } else { volume };
 
             let device = cc.storage.and_then(|s| s.get_string("output_device")).filter(|d| !d.is_empty());
+            // The mixer rate, when the listener picked one (Settings › Playback ›
+            // Output sample rate): the mixer is built once with it at launch.
+            let sample_rate = cc.storage.and_then(|s| s.get_string("output_sample_rate")).and_then(|v| v.parse().ok());
 
             let (audio_tx, audio_rx) = unbounded();
-            let audio = audio::spawn(volume, log_volume, device, audio_tx, wake);
+            let audio = audio::spawn(volume, log_volume, device, sample_rate, audio_tx, wake);
 
             let data_dir = data_dir();
             let (resp_tx, resp_rx) = unbounded();
@@ -259,6 +269,119 @@ fn init_logging() {
     builder.init();
 }
 
+/// Seed the hi-res addon list with MadFLAC on first run: when the listener has no
+/// hi-res sources configured, the list starts with the MadFLAC manifest, enabled.
+/// Deleting that line removes it for good: `madflac_seeded` records that the choice
+/// was made, so later starts never re-add it — including when the list is empty
+/// because the listener cleared it.
+///
+/// The seed goes into the settings file (`app.ron`) directly, because eframe hands
+/// this process only a shared reference to its storage, and `set_string` needs a
+/// mutable one. The file is a pretty-printed RON map of strings; the edit is
+/// line-based and aborts on any shape it doesn't recognise, leaving the file alone
+/// rather than risking the listener's settings. The pre-seed file is kept once as
+/// `app.ron.bak-madflac-seed`.
+fn seed_madflac(data_dir: &std::path::Path) {
+    let _ = std::fs::create_dir_all(data_dir);
+    let path = data_dir.join("app.ron");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let next = if text.trim().is_empty() {
+        Some(format!("{{\n    \"hires_source\": \"{}\",\n    \"madflac_seeded\": \"1\",\n}}\n", crate::hires::MADFLAC_MANIFEST_URL))
+    } else {
+        seed_madflac_in_ron(&text)
+    };
+    if let Some(next) = next {
+        if !text.trim().is_empty() {
+            let backup = data_dir.join("app.ron.bak-madflac-seed");
+            if !backup.exists() {
+                let _ = std::fs::copy(&path, &backup);
+            }
+        }
+        if let Err(e) = std::fs::write(&path, next) {
+            log::warn!("couldn't seed the MadFLAC hi-res source: {e:#}");
+        }
+    }
+}
+
+/// Seed MadFLAC into an eframe settings file's text, returning the new text. `None`
+/// when the file already records the decision (`madflac_seeded`), or when it isn't
+/// the pretty-printed map shape expected.
+fn seed_madflac_in_ron(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return None;
+    }
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    // Pretty RON puts the opening brace on its own line; anything else is not a
+    // file this editor understands.
+    if lines.first().is_none_or(|l| l.trim() != "{") {
+        return None;
+    }
+    if lines.iter().any(|l| l.trim_start().starts_with("\"madflac_seeded\":")) {
+        return None;
+    }
+    let url = crate::hires::MADFLAC_MANIFEST_URL;
+    let mut found = false;
+    for line in lines.iter_mut() {
+        if line.trim_start().starts_with("\"hires_source\":") {
+            found = true;
+            match ron_string_value(line) {
+                Some((start, end, value)) if value.trim().is_empty() => {
+                    // The key is there but empty: fill it in.
+                    let mut replaced = String::with_capacity(line.len() + url.len());
+                    replaced.push_str(&line[..start]);
+                    replaced.push('"');
+                    replaced.push_str(url);
+                    replaced.push('"');
+                    replaced.push_str(&line[end..]);
+                    *line = replaced;
+                }
+                Some(_) => {} // The listener already has sources: keep them.
+                None => return None,
+            }
+            break;
+        }
+    }
+    // The flag goes right after the opening brace, so it is set even when the
+    // listener already has sources: a list emptied later must not re-seed.
+    lines.insert(1, "    \"madflac_seeded\": \"1\",".to_owned());
+    if !found {
+        lines.insert(1, format!("    \"hires_source\": \"{url}\","));
+    }
+    Some(lines.join("\n") + "\n")
+}
+
+/// The quoted string value of a pretty-RON `"key": "value",` line: the byte span of
+/// the value's quotes and the value unescaped. `None` when the line isn't one.
+fn ron_string_value(line: &str) -> Option<(usize, usize, String)> {
+    let colon = line.find(':')?;
+    let rest = &line[colon + 1..];
+    let rest = rest.trim_start();
+    if !rest.starts_with('"') {
+        return None;
+    }
+    let start = line.len() - rest.len();
+    let mut value = String::new();
+    let mut chars = line[start + 1..].char_indices();
+    while let Some((off, ch)) = chars.next() {
+        match ch {
+            '\\' => {
+                let (_, next) = chars.next()?;
+                value.push(match next {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    '0' => '\0',
+                    other => other,
+                });
+            }
+            '"' => return Some((start, start + 1 + off + 1, value)),
+            _ => value.push(ch),
+        }
+    }
+    None
+}
+
 /// Settings, caches and the sign-in: `data` beside the portable build's exe, else the
 /// user's app data. Dev hook: YTM_DATA_DIR runs on a separate profile.
 fn data_dir() -> std::path::PathBuf {
@@ -269,4 +392,51 @@ fn data_dir() -> std::path::PathBuf {
         return dir.join("data");
     }
     directories::ProjectDirs::from("", "", "ytm-rs").expect("no home directory").data_dir().to_path_buf()
+}
+
+
+#[cfg(test)]
+mod seed_tests {
+    use super::seed_madflac_in_ron;
+    use crate::hires::MADFLAC_MANIFEST_URL;
+
+    #[test]
+    fn an_empty_map_gets_the_seed_and_the_flag() {
+        let out = seed_madflac_in_ron("{\n}\n").expect("seeded");
+        assert!(out.contains(&format!("\"hires_source\": \"{MADFLAC_MANIFEST_URL}\"")), "{out}");
+        assert!(out.contains("\"madflac_seeded\": \"1\""), "{out}");
+    }
+
+    #[test]
+    fn other_settings_survive_and_existing_sources_are_kept() {
+        let text = "{\n    \"volume\": \"0.8\",\n    \"hires_source\": \"https://other.example/addon\",\n}\n";
+        let out = seed_madflac_in_ron(text).expect("seeded");
+        assert!(out.contains("\"volume\": \"0.8\""), "{out}");
+        assert!(out.contains("\"hires_source\": \"https://other.example/addon\""), "{out}");
+        assert!(!out.contains(MADFLAC_MANIFEST_URL), "{out}");
+        assert!(out.contains("\"madflac_seeded\": \"1\""), "{out}");
+    }
+
+    #[test]
+    fn an_empty_source_is_filled_in() {
+        let text = "{\n    \"hires_source\": \"\",\n}\n";
+        let out = seed_madflac_in_ron(text).expect("seeded");
+        assert!(out.contains(&format!("\"hires_source\": \"{MADFLAC_MANIFEST_URL}\"")), "{out}");
+        assert!(out.contains("\"madflac_seeded\": \"1\""), "{out}");
+    }
+
+    #[test]
+    fn a_seeded_file_is_left_alone() {
+        let text = format!("{{\n    \"hires_source\": \"{MADFLAC_MANIFEST_URL}\",\n    \"madflac_seeded\": \"1\",\n}}\n");
+        assert!(seed_madflac_in_ron(&text).is_none());
+        let cleared = "{\n    \"hires_source\": \"\",\n    \"madflac_seeded\": \"1\",\n}\n";
+        assert!(seed_madflac_in_ron(cleared).is_none(), "a cleared list is not re-seeded");
+    }
+
+    #[test]
+    fn an_unexpected_shape_is_left_alone() {
+        assert!(seed_madflac_in_ron("").is_none());
+        assert!(seed_madflac_in_ron("not ron at all").is_none());
+        assert!(seed_madflac_in_ron("{\"hires_source\": \"\"}").is_none(), "compact RON is not edited");
+    }
 }

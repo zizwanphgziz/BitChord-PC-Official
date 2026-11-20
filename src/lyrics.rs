@@ -1477,6 +1477,27 @@ mod tests {
     }
 
     #[test]
+    fn enhanced_lrc_word_times_drive_word_sync() {
+        // Every word carries its own `<mm:ss.xx>` stamp: the line is word-timed,
+        // so the karaoke view can light each word as it is sung.
+        let lines = parse_lrc("[00:01.00]<00:01.00>Hello <00:01.50>brave <00:02.00>new <00:02.50>world\n[00:04.00]Done", 5000);
+        let words: Vec<&str> = lines[0].parts.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(words, ["Hello ", "brave ", "new ", "world"]);
+        assert_eq!(lines[0].parts.iter().map(|p| p.start).collect::<Vec<_>>(), [1000, 1500, 2000, 2500]);
+        let lyrics = Lyrics::new(Provider::MusixmatchRich, lines, None, vec![]).unwrap();
+        assert_eq!(lyrics.sync, Sync::Word);
+    }
+
+    #[test]
+    fn line_only_lrc_has_no_word_times() {
+        // Plain line LRC: no parts, so the view falls back to lighting the line.
+        let lines = parse_lrc("[00:01.00]Hello brave new world\n[00:04.00]Done", 5000);
+        assert!(lines.iter().all(|l| l.parts.is_empty()));
+        let lyrics = Lyrics::new(Provider::LrclibSynced, lines, None, vec![]).unwrap();
+        assert_eq!(lyrics.sync, Sync::Line);
+    }
+
+    #[test]
     fn lrc_skips_credits_and_reads_offset() {
         // The extension reads `offset` in seconds.
         let l = parse_lrc("[offset:+0.5]\n[00:01.00]作词 : 野田洋次郎\n[00:05.00]Hello\n[00:07.00]World", 10_000);

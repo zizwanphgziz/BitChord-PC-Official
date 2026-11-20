@@ -5,7 +5,7 @@
 use egui::{Color32, Rect, Sense, Ui, Vec2, pos2, vec2};
 
 use super::widgets::{self, icon_button, named, text_at};
-use super::{Action, App, NpTab, Repeat, glyphs, karaoke};
+use super::{Action, App, NpTab, Page, Repeat, glyphs, karaoke};
 use crate::lyrics::{Lyrics, Sync, SyncKind};
 use crate::shader::Params;
 use crate::theme::{self, icon};
@@ -823,6 +823,21 @@ fn options_menu(app: &mut App, ui: &mut Ui, rect: Rect, track: &crate::model::Tr
                 app.actions.push(Action::UpgradeQuality);
             }
         }
+        // Playback speed (same presets as Settings › Playback) and the sleep
+        // timer, which lives in Settings › Playback.
+        menu_divider(ui);
+        menu_caption(ui, "SPEED");
+        let cur = app.speed();
+        for v in crate::audio::SPEED_PRESETS {
+            let glyph = if (v - cur).abs() < f32::EPSILON { Some(icon::CHECK) } else { None };
+            if widgets::menu_action(ui, glyph, &format!("{v}×")) {
+                app.set_speed(v);
+            }
+        }
+        menu_divider(ui);
+        if widgets::menu_action(ui, Some(icon::SETTINGS), "Sleep timer…") {
+            app.go(Page::Settings);
+        }
         ui.add_space(4.0);
     });
 }
@@ -957,7 +972,8 @@ pub(super) fn audio_badge_width(ui: &Ui, app: &App, small: bool) -> f32 {
     if info.atmos && !app.mixing() {
         return gh * quality_icon_aspect(true);
     }
-    let label = if app.mixing() { "Mixing" } else { info.badge() };
+    let badge = info.badge_line();
+    let label = if app.mixing() { "Mixing" } else { badge.as_str() };
     let text = widgets::galley(ui, label, badge_font(small), Color32::WHITE, 200.0).size().x;
     if has_quality_glyph(info) { text + gh * quality_mark_aspect(info.atmos) + 5.0 } else { text }
 }
@@ -990,7 +1006,8 @@ pub(super) fn audio_badge(app: &App, ui: &mut Ui, at: egui::Pos2, small: bool) -
     let Some((_, info)) = app.audio_info.as_ref() else { return 0.0 };
     let font = badge_font(small);
     // A mix in progress wears its own name over the quality mark; the details keep the truth.
-    let g = widgets::galley(ui, if app.mixing() { "Mixing" } else { info.badge() }, font, Color32::WHITE, 200.0);
+    let badge = info.badge_line();
+    let g = widgets::galley(ui, if app.mixing() { "Mixing" } else { badge.as_str() }, font, Color32::WHITE, 200.0);
     let gh = glyph_side(small);
     // Dolby's lockup carries its own words, so it stands alone instead of beside them.
     let lockup = info.atmos && !app.mixing();

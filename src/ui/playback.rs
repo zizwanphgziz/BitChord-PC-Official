@@ -276,6 +276,14 @@ impl App {
     /// Start the current track, opened directly at `at` so nothing plays from 0:00 first.
     /// `report`: a new play for the account's history (not picking up last session's song).
     pub(super) fn play_current_at(&mut self, at: Duration, report: bool) {
+        // "Stop after this track", safety net for the paths that call `play_current`
+        // directly (repeat-one): the flag is consumed here instead of starting the
+        // next song. The normal path is `next_after_end` (see the Finished arm).
+        if crate::sleep_timer::take_stop_pending() {
+            log::info!("sleep timer: stopped after this track");
+            self.toast("Sleep timer: stopped after this track");
+            return;
+        }
         let Some(track) = self.current().cloned() else { return };
         // A natural Automix handoff keeps the outgoing song on screen until the next one
         // is louder (see `MixFrom`); any other play switches at once.
@@ -453,6 +461,101 @@ impl App {
         } else {
             self.audio.send(AudioCmd::Seek(at));
         }
+    }
+
+    /// Playback speed, 0.5–2× (see `audio::AudioHandle::set_speed`). Applies to
+    /// the track playing now and to every track after it; it stays where the
+    /// listener put it across songs.
+    pub(super) fn set_speed(&mut self, v: f32) {
+        self.audio.set_speed(v);
+    }
+
+    pub(super) fn speed(&self) -> f32 {
+        self.audio.speed()
+    }
+
+    /// The sleep timer's UI-tick check (called from `logic`, next to
+    /// `sync_lastfm`): a minutes timer that ran out pauses playback now.
+    /// One-shot on either side: the audio thread checks the same flag in its
+    /// own loop, so whichever fires first is the only one that does. A timer
+    /// that runs out while paused simply clears itself.
+    pub(super) fn tick_sleep_timer(&mut self) {
+        // `playing` first: a timer that runs out while paused stays armed and
+        // fires as soon as playback resumes, instead of clearing silently.
+        if self.playing() && crate::sleep_timer::take_due() {
+            log::info!("sleep timer fired, pausing");
+            self.audio.send(AudioCmd::Pause);
+            self.toast("Sleep timer: paused playback");
+        }
+    }
+
+    /// Advance after a track ended naturally — unless "stop after this track" was
+    /// armed, in which case stay on the finished song, paused. (The Finished arm
+    /// in `responses.rs` calls this instead of `next`.)
+    pub(super) fn next_after_end(&mut self) {
+        if crate::sleep_timer::take_stop_pending() {
+            log::info!("sleep timer: stopped after this track");
+            self.toast("Sleep timer: stopped after this track");
+            return;
+        }
+        self.next();
+    }
+
+    /// Tell ListenBrainz what's playing, and scrobble it once it has played half
+    /// its length or 4 minutes (songs under 30 s don't count): the same rule
+    /// Last.fm uses (`sync_lastfm`). Runs every frame, like Last.fm's. The
+    /// per-generation state lives in the ListenBrainz module, next to its queue.
+    pub(super) fn sync_listenbrainz(&mut self) {
+        if let Some(r) = crate::listenbrainz::take_test_result() {
+            match r {
+                Ok(name) => self.toast(format!("ListenBrainz token is valid for {name}")),
+                Err(e) => self.toast(format!("ListenBrainz test failed: {e}")),
+            }
+        }
+        if !crate::listenbrainz::enabled() || crate::listenbrainz::token().is_none() {
+            return;
+        }
+        let Some(t) = self.playing_track().filter(|_| self.playing() && !self.buffering) else { return };
+        let pos = self.audio.status.position();
+        let dur = Duration::from_millis(self.audio.status.duration_ms.load(Ordering::Relaxed));
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let play = crate::lastfm::Scrobble {
+            artist: t.artists.first().map(|a| a.name.clone()).unwrap_or_default(),
+            track: t.title.clone(),
+            album: t.album.as_ref().map(|a| a.name.clone()),
+            duration: (!dur.is_zero()).then_some(dur.as_secs() as u32),
+            timestamp: now - pos.as_secs() as i64,
+        };
+        if play.artist.is_empty() {
+            return;
+        }
+        let http = self.backend.http();
+        if crate::listenbrainz::note_started(self.generation) {
+            let p = play.clone();
+            self.backend.spawn(async move { crate::listenbrainz::now_playing(&http, &p).await });
+            return;
+        }
+        if dur >= Duration::from_secs(30) && pos >= (dur / 2).min(Duration::from_secs(240)) && crate::listenbrainz::note_scrobbled(self.generation) {
+            self.backend.spawn(async move { crate::listenbrainz::scrobble(&http, play).await });
+        }
+    }
+
+    /// Check the saved ListenBrainz token against ListenBrainz (the "Test"
+    /// button in Settings › Connections). The answer lands in the module and is
+    /// toasted by `sync_listenbrainz` on the next frame.
+    pub(super) fn listenbrainz_test(&mut self) {
+        let Some(token) = crate::listenbrainz::token() else {
+            self.toast("ListenBrainz: paste your user token first");
+            return;
+        };
+        if !crate::listenbrainz::test_start() {
+            return;
+        }
+        let http = self.backend.http();
+        self.backend.spawn(async move {
+            let r = crate::listenbrainz::validate_token(&http, &token).await.map_err(|e| format!("{e:#}"));
+            crate::listenbrainz::test_finish(r);
+        });
     }
 
     pub(super) fn toggle(&mut self) {

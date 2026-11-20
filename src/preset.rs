@@ -374,9 +374,14 @@ impl Preset {
     }
 
     /// The accent to use given the one sampled from the current cover.
+    /// A cover-derived accent follows the "Dynamic theme from artwork" toggle:
+    /// off, the default accent shows whatever the cover looks like.
     pub fn accent(&self, from_cover: Color32) -> Color32 {
         if self.accent == "system" {
             return crate::theme::system_accent().unwrap_or(from_cover);
+        }
+        if self.accent == "cover" {
+            return crate::theme::dynamic_accent(from_cover);
         }
         hex(&self.accent).unwrap_or(from_cover)
     }

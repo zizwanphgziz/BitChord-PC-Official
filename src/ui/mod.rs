@@ -599,6 +599,7 @@ impl App {
         let get = |k: &str| storage.and_then(|s| s.get_string(k));
         // Dev hook: YTM_FONT=<font name> tries a font without saving it.
         theme::set_font_choice(&dev_var("YTM_FONT").map(str::to_owned).or_else(|| get("font")).unwrap_or_default());
+        crate::theme::load_dynamic_theme(&get);
         let discord_enabled = get("discord_enabled").is_none_or(|v| v == "1");
         let app_icon = crate::appicon::load(backend.data_dir());
         let wgpu_renderer = crate::renderer::load(backend.data_dir()) == crate::renderer::Renderer::Wgpu;
@@ -606,7 +607,10 @@ impl App {
         // and keep the Start menu link pointing at this exe.
         crate::appicon::sync_shortcuts(app_icon, backend.data_dir());
         crate::downloads::init(backend.data_dir(), &get("download_dir").unwrap_or_default());
+        crate::locallib::init(backend.data_dir());
         crate::lastfm::init(backend.data_dir());
+        crate::listenbrainz::init(backend.data_dir());
+        crate::sleep_timer::init(backend.data_dir());
         let logged_in = backend.is_logged_in();
         // Before any request: a song started at launch (dev hooks) must see this setting.
         backend.set_high_quality(get("high_quality").is_none_or(|v| v == "1"));
@@ -827,6 +831,9 @@ impl App {
             smoke: None,
         };
         app.request_liked(false);
+        if let Some(v) = get("playback_speed").and_then(|v| v.parse::<f32>().ok()) {
+            app.audio.set_speed(v);
+        }
         // Dev hooks: YTM_SMOKE="query" searches and plays the first song ("id:<videoId>[,<videoId>…]"
         // plays that video); YTM_SEARCH
         // only searches; YTM_PAGE opens a page; YTM_NOWPLAYING opens the overlay.
@@ -1264,6 +1271,8 @@ impl eframe::App for App {
         self.window_hidden = self.tray.is_some() || ctx.input(|i| i.viewport().minimized == Some(true));
         self.sync_discord();
         self.sync_lastfm();
+        self.tick_sleep_timer();
+        self.sync_listenbrainz();
         self.sync_server_queue(ctx, now);
         self.tick_updates(ctx, now);
         let np = widgets::NowPlaying {
@@ -1565,6 +1574,8 @@ impl eframe::App for App {
         storage.set_string("prefer_atmos", b(self.prefer_atmos));
         storage.set_string("show_nerd_stats", b(self.show_nerd_stats));
         storage.set_string("disable_direct_stream", b(self.disable_direct_stream));
+        storage.set_string("playback_speed", self.audio.speed().to_string());
+        storage.set_string("output_sample_rate", self.audio.sample_rate_pref().map_or(String::new(), |r| r.to_string()));
         storage.set_string("sponsorblock", b(self.sponsorblock));
         storage.set_string("crossfade", b(self.crossfade));
         storage.set_string("automix", b(self.automix));
@@ -1574,6 +1585,7 @@ impl eframe::App for App {
         // Background test runs mustn't change the listener's sources or per-song picks.
         if std::env::var_os("YTM_BACKGROUND").is_none() || std::env::var_os("YTM_SAVE_SESSION").is_some() {
             self.lyric_prefs.save(storage);
+            crate::theme::save_dynamic_theme(storage);
         }
         storage.set_string("np_art", b(self.np_tab == NpTab::Art));
         // Background test runs leave the user's real "last song" alone unless asked.

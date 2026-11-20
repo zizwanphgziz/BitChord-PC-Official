@@ -19,6 +19,82 @@ const TEXT_FAINT_LIGHT: Color32 = Color32::from_rgb(124, 118, 132);
 /// Default accent until a cover provides one (BitChord pink).
 pub const RED: Color32 = Color32::from_rgb(0xFA, 0x58, 0x6A);
 
+// ------------------------------------------------------------------ dynamic theme
+
+/// "Dynamic theme from artwork" (Settings › Appearance), on by default: the
+/// cover's colours drive the accent, highlights and now-playing background tint.
+/// Off, the app falls back to the default accent (`RED`) and the preset's own
+/// colours, whatever the cover looks like. Kept here (not on `App`) so the
+/// preset's `accent()` — the one place every accent flows through — can read it.
+static DYNAMIC_THEME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether cover art drives the theme right now.
+pub fn dynamic_theme() -> bool {
+    DYNAMIC_THEME.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_dynamic_theme(on: bool) {
+    DYNAMIC_THEME.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the toggle from storage (`"dynamic_theme"`: absent or `"1"` is on).
+pub fn load_dynamic_theme(get: &dyn Fn(&str) -> Option<String>) {
+    set_dynamic_theme(get("dynamic_theme").is_none_or(|v| v != "0"));
+}
+
+pub fn save_dynamic_theme(storage: &mut dyn eframe::Storage) {
+    storage.set_string("dynamic_theme", if dynamic_theme() { "1".to_owned() } else { "0".to_owned() });
+}
+
+/// The accent for a cover-derived colour: the cover's colour while the dynamic
+/// theme is on (lifted until it reads against the background), the default
+/// accent while it is off.
+pub fn dynamic_accent(from_cover: Color32) -> Color32 {
+    if !dynamic_theme() {
+        return RED;
+    }
+    ensure_contrast(from_cover, bg(), 3.0)
+}
+
+// ------------------------------------------------------------------ artwork palette
+
+/// WCAG relative luminance of an sRGB colour.
+pub fn luminance(c: Color32) -> f32 {
+    let f = |v: u8| {
+        let v = v as f32 / 255.0;
+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
+}
+
+/// WCAG contrast ratio between two colours (1.0 = identical, 21.0 = black/white).
+pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let (hi, lo) = {
+        let (x, y) = (luminance(a), luminance(b));
+        if x > y { (x, y) } else { (y, x) }
+    };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Nudge `fg` toward white (on a dark background) or black (on a light one)
+/// until it reaches `min` contrast against `bg`, or stops moving. Accent
+/// colours only need 3:1 (they are never body text); body text wants 4.5:1.
+pub fn ensure_contrast(fg: Color32, bg: Color32, min: f32) -> Color32 {
+    if contrast_ratio(fg, bg) >= min {
+        return fg;
+    }
+    let to_white = luminance(bg) < 0.5;
+    let target = if to_white { Color32::WHITE } else { Color32::BLACK };
+    let mut fg = fg;
+    for _ in 0..16 {
+        fg = lerp_color(fg, target, 0.15);
+        if contrast_ratio(fg, bg) >= min {
+            break;
+        }
+    }
+    fg
+}
+
 /// Light or dark, as the app picked it for what's being drawn (see `set_mode`): the
 /// colours below follow it. Now playing always draws dark, over the album art.
 static LIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1047,3 +1123,30 @@ fn visuals() -> egui::Visuals {
     v
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contrast_math() {
+        assert!((contrast_ratio(Color32::BLACK, Color32::WHITE) - 21.0).abs() < 0.1);
+        assert!((contrast_ratio(Color32::WHITE, Color32::WHITE) - 1.0).abs() < 0.01);
+        // A dark grey on the dark background is unreadable until lifted.
+        let dim = Color32::from_rgb(40, 38, 44);
+        assert!(contrast_ratio(dim, bg()) < 3.0);
+        assert!(contrast_ratio(ensure_contrast(dim, bg(), 3.0), bg()) >= 3.0);
+        // An already-readable colour is left alone.
+        assert_eq!(ensure_contrast(Color32::WHITE, bg(), 3.0), Color32::WHITE);
+    }
+
+    #[test]
+    fn dynamic_theme_toggle_gates_cover_accent() {
+        assert!(dynamic_theme());
+        let cover = Color32::from_rgb(30, 200, 120);
+        assert_ne!(dynamic_accent(cover), RED);
+        set_dynamic_theme(false);
+        assert_eq!(dynamic_accent(cover), RED);
+        set_dynamic_theme(true);
+        assert!(dynamic_theme());
+    }
+}

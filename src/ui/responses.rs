@@ -38,7 +38,7 @@ impl App {
                         // The sleeve was this song's: put it down rather than keep its
                         // decoder, frame and texture for the rest of the session.
                         self.deload_motion();
-                        self.next();
+                        self.next_after_end();
                     }
                 }
                 AudioEvent::Finished { .. } => {}
@@ -634,6 +634,15 @@ impl App {
                 self.toast(format!("Can't play \"{title}\": {reason}"));
             }
         }
+    }
+
+    /// Test a hi-res source again, from its settings row's Test button: forget what
+    /// the last test said and ask afresh. The verdict lands back in `hires_checks`
+    /// (see `Resp::HiResSourceChecked`), so the row shows the new status.
+    pub(super) fn hires_retest(&mut self, link: &str) {
+        self.hires_checks.remove(link);
+        self.hires_checking.remove(link);
+        self.hires_check(link);
     }
 
     /// Signed in or out: what belonged to the last account goes, and the new one's home,

@@ -474,6 +474,21 @@ const PREFETCH_SONG_WAIT: std::time::Duration = std::time::Duration::from_secs(2
 /// How long playback waits for the hi-res sources before falling back to YouTube. A cold
 /// addon mints a lossless URL in a few seconds, and every source is asked at once.
 const HIRES_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+/// How many times an upgrade keeps asking the addons for a copy while the song plays.
+/// One ask is rarely enough for a cold addon: the play's own wait is spent before the
+/// stream call even starts (manifest, then search, then stream, each with its own
+/// timeout), so the first ask times out with the copy still on its way. The manifest
+/// and search are remembered per addon, so later asks are mostly the stream call itself.
+const UPGRADE_ATTEMPTS: usize = 3;
+/// How long each upgrade attempt may take. Later attempts get longer: the first is the
+/// play's own wait, the later ones give a cold stream call its full time.
+const UPGRADE_WAITS: [std::time::Duration; UPGRADE_ATTEMPTS] =
+    [HIRES_WAIT, std::time::Duration::from_secs(30), std::time::Duration::from_secs(45)];
+/// Pauses between upgrade attempts, so a struggling addon isn't hammered.
+const UPGRADE_BACKOFF: [std::time::Duration; UPGRADE_ATTEMPTS - 1] =
+    [std::time::Duration::from_secs(5), std::time::Duration::from_secs(10)];
+/// Stop asking once the song is this close to ending: a swap there isn't heard.
+const UPGRADE_MIN_REMAINING: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[derive(Clone)]
 pub struct Backend {
@@ -501,6 +516,10 @@ pub struct Backend {
     hires: Arc<std::sync::RwLock<Vec<Arc<hires::Client>>>>,
     /// Ask the addons for Dolby Atmos renditions when they offer one.
     atmos: Arc<std::sync::atomic::AtomicBool>,
+    /// Automatically upgrade a song that started on YouTube audio to a hi-res copy
+    /// while it plays (default on; Settings › Playback turns it off). Manual upgrades
+    /// ignore it.
+    auto_upgrade: Arc<std::sync::atomic::AtomicBool>,
     /// Play YouTube first and upgrade to hi-res in the background.
     disable_direct: Arc<std::sync::atomic::AtomicBool>,
     /// Songs the listener sent back to YouTube audio: no addon copy until they leave.
@@ -535,7 +554,7 @@ impl Backend {
         {
             log::warn!("proxy relay: {e:#}");
         }
-        let backend = Self { rt: Arc::new(rt), api, tx, audio, wake, prefetched: Default::default(), current: Default::default(), data_dir, lyrics, translate, jsc, premium: Arc::new(tokio::sync::Mutex::new(Err(None))), hq: Default::default(), hires: Default::default(), atmos: Default::default(), disable_direct: Default::default(), reverted: Default::default(), songs: Default::default() };
+        let backend = Self { rt: Arc::new(rt), api, tx, audio, wake, prefetched: Default::default(), current: Default::default(), data_dir: data_dir.clone(), lyrics, translate, jsc, premium: Arc::new(tokio::sync::Mutex::new(Err(None))), hq: Default::default(), hires: Default::default(), atmos: Default::default(), auto_upgrade: Arc::new(load_auto_upgrade(&data_dir).into()), disable_direct: Default::default(), reverted: Default::default(), songs: Default::default() };
         backend.keep_signed_in();
         Ok(backend)
     }
@@ -1197,7 +1216,9 @@ impl Backend {
                         }
                     });
                 }
-                if let Some((this, id, Some(track))) = upgrade.filter(|_| audio.status.wanted_gen.load(Ordering::Relaxed) == generation) {
+                // Automatic upgrades only: the manual "Upgrade quality" goes through
+                // `try_upgrade_active` instead, and works with the setting off.
+                if let Some((this, id, Some(track))) = upgrade.filter(|(this, _, _)| this.auto_upgrade.load(Ordering::Relaxed) && audio.status.wanted_gen.load(Ordering::Relaxed) == generation) {
                     let rt = this.rt.clone();
                     rt.spawn(async move {
                         this.try_upgrade_hires(id, generation, track).await;
@@ -1358,6 +1379,15 @@ impl Backend {
     async fn open_stream(&self, video_id: &str, prefetch: bool, track: Option<&Track>) -> anyhow::Result<Arc<Shared>> {
         let id = video_id.to_owned();
         if let Some(shared) = tokio::task::spawn_blocking(move || crate::downloads::open(&id)).await? {
+            return Ok(shared);
+        }
+        // Local files: same decoder path as downloads, before the YouTube resolver.
+        if let Some(shared) = tokio::task::spawn_blocking({
+            let id = video_id.to_owned();
+            move || crate::locallib::open(&id)
+        })
+        .await?
+        {
             return Ok(shared);
         }
         let (source, s) = self.resolve(video_id, false, track, !self.disable_direct.load(Ordering::Relaxed), prefetch).await?;
@@ -1623,6 +1653,21 @@ impl Backend {
         self.atmos.store(on, Ordering::Relaxed);
     }
 
+    /// Whether a song that started on YouTube audio is automatically upgraded to a
+    /// hi-res copy while it plays.
+    pub fn auto_upgrade(&self) -> bool {
+        self.auto_upgrade.load(Ordering::Relaxed)
+    }
+
+    /// Turn automatic quality upgrades on or off. The choice is kept in the data dir,
+    /// beside the other data, so it survives a restart; manual upgrades ignore it.
+    pub fn set_auto_upgrade(&self, on: bool) {
+        self.auto_upgrade.store(on, Ordering::Relaxed);
+        if let Err(e) = std::fs::write(self.data_dir.join("auto_upgrade"), if on { "1" } else { "0" }) {
+            log::warn!("couldn't remember the auto-upgrade setting: {e:#}");
+        }
+    }
+
     /// Play YouTube immediately and upgrade to hi-res in the background.
     pub fn set_disable_direct_stream(&self, on: bool) {
         self.disable_direct.store(on, Ordering::Relaxed);
@@ -1639,7 +1684,12 @@ impl Backend {
     }
 
     /// After playback starts on YouTube, opportunistically look for a hi-res
-    /// rendition from addons and upgrade the playing stream in place.
+    /// rendition from addons and upgrade the playing stream in place. One ask is
+    /// rarely enough for a cold addon (see `UPGRADE_ATTEMPTS`): keep asking, with
+    /// pauses, while the song plays, and stop once it is nearly over, skipped past
+    /// or sent back to YouTube. The player shows "Upgrading quality" for the whole
+    /// run (the guard below), and the swap itself keeps the position and the
+    /// play/pause state (see `AudioCmd::Upgrade`).
     async fn try_upgrade_hires(&self, video_id: String, generation: u64, track: Track) {
         if self.audio.status.wanted_gen.load(Ordering::Relaxed) != generation {
             return;
@@ -1666,18 +1716,38 @@ impl Backend {
         }
         let _guard = UpgradeGuard { backend: self, generation };
 
-        let started = std::time::Instant::now();
-        let stream_res = match tokio::time::timeout(HIRES_WAIT, self.from_hires(&hires, &track, false)).await {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                log::info!("{video_id}: no hi-res source has a copy ({:.1}s)", started.elapsed().as_secs_f32());
+        let mut stream_res = None;
+        for attempt in 0..UPGRADE_ATTEMPTS {
+            if self.audio.status.wanted_gen.load(Ordering::Relaxed) != generation
+                || self.reverted.lock().unwrap().contains(&video_id)
+            {
+                log::debug!("hi-res upgrade for {video_id} dropped: left or reverted during attempt {}", attempt + 1);
                 return;
             }
-            Err(_) => {
-                log::info!("{video_id}: the hi-res sources gave no answer in {HIRES_WAIT:?}");
+            if attempt > 0 {
+                tokio::time::sleep(UPGRADE_BACKOFF[attempt - 1]).await;
+                if self.audio.status.wanted_gen.load(Ordering::Relaxed) != generation
+                    || self.reverted.lock().unwrap().contains(&video_id)
+                {
+                    return;
+                }
+            }
+            if !self.upgrade_worthwhile(&track) {
+                log::info!("{video_id}: stopping hi-res upgrade, the song is nearly over");
                 return;
             }
-        };
+            let wait = UPGRADE_WAITS[attempt];
+            let started = std::time::Instant::now();
+            match tokio::time::timeout(wait, self.from_hires(&hires, &track, false)).await {
+                Ok(Some(s)) => {
+                    stream_res = Some(s);
+                    break;
+                }
+                Ok(None) => log::info!("{video_id}: no hi-res source has a copy (attempt {} in {:.1}s)", attempt + 1, started.elapsed().as_secs_f32()),
+                Err(_) => log::info!("{video_id}: the hi-res sources gave no answer in {wait:?} (attempt {})", attempt + 1),
+            }
+        }
+        let Some(stream_res) = stream_res else { return };
 
         if self.audio.status.wanted_gen.load(Ordering::Relaxed) != generation {
             log::debug!("hi-res upgrade for {video_id} dropped: generation changed");
@@ -1759,6 +1829,14 @@ impl Backend {
             at: actual_pos,
             seekable,
         });
+    }
+
+    /// Whether an upgrade is still worth asking for: the song has enough left to
+    /// hear the better copy in. An unknown length never blocks it.
+    fn upgrade_worthwhile(&self, track: &Track) -> bool {
+        let Some(secs) = track.duration else { return true };
+        let remaining = (secs as u64 * 1000).saturating_sub(self.audio.status.position().as_millis() as u64);
+        remaining > UPGRADE_MIN_REMAINING.as_millis() as u64
     }
 
     /// Upgrade the active song if it is playing standard YouTube quality and not reverted.
@@ -1848,6 +1926,12 @@ impl Backend {
     pub fn is_logged_in(&self) -> bool {
         self.api.account().is_some()
     }
+}
+
+/// Whether automatic quality upgrades are on, from the `auto_upgrade` file beside
+/// the other data (missing or unreadable: on).
+fn load_auto_upgrade(data_dir: &std::path::Path) -> bool {
+    std::fs::read_to_string(data_dir.join("auto_upgrade")).map_or(true, |v| v.trim() != "0")
 }
 
 /// Test instances (`YTM_BACKGROUND`) keep plays out of the account's history unless

@@ -6,6 +6,85 @@ use std::collections::HashMap;
 
 use crate::lyrics::{Line, Lyrics, LyricsSet, Provider};
 
+/// How the sung words light up: the listener's pick in Settings › Lyrics.
+/// `Auto` (the default) lights each word when word timing is available for the
+/// song, and the whole line at once when only line timing is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Highlight {
+    #[default]
+    Auto,
+    Word,
+    Line,
+    Sweep,
+}
+
+impl Highlight {
+    pub const ALL: [Self; 4] = [Self::Auto, Self::Word, Self::Line, Self::Sweep];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Automatic",
+            Self::Word => "Word by word",
+            Self::Line => "Line by line",
+            Self::Sweep => "Sweep",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Word => "word",
+            Self::Line => "line",
+            Self::Sweep => "sweep",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Self {
+        Self::ALL.into_iter().find(|h| h.key() == s).unwrap_or_default()
+    }
+
+    /// The renderer's fill for a song whose word timing is (`word_timed`) or isn't
+    /// available. Automatic follows the timing; an explicit pick wins, except that
+    /// "word by word" on line-only lyrics falls back to the whole line (there is
+    /// nothing finer to light).
+    pub fn fill(self, word_timed: bool) -> crate::preset::Fill {
+        use crate::preset::Fill;
+        match self {
+            Self::Auto => {
+                if word_timed {
+                    Fill::Word
+                } else {
+                    Fill::Line
+                }
+            }
+            Self::Word => {
+                if word_timed {
+                    Fill::Word
+                } else {
+                    Fill::Line
+                }
+            }
+            Self::Line => Fill::Line,
+            Self::Sweep => Fill::Sweep,
+        }
+    }
+}
+
+/// The highlight in force right now, for the karaoke renderer (which reads the
+/// preset's lyric style, not these prefs): kept in step with `Prefs::highlight`
+/// by `Prefs::load` and `Prefs::set_highlight`, the way the font choice lives in
+/// `theme::FONT_CHOICE`. Defaults to `Auto` until any prefs are loaded.
+static HIGHLIGHT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The highlight mode the renderer should use this frame.
+pub fn highlight_current() -> Highlight {
+    Highlight::ALL[HIGHLIGHT.load(std::sync::atomic::Ordering::Relaxed) as usize % Highlight::ALL.len()]
+}
+
+fn set_highlight_current(h: Highlight) {
+    HIGHLIGHT.store(Highlight::ALL.iter().position(|x| *x == h).unwrap_or(0) as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Offsets are seconds taken off the lyrics clock: positive shows lyrics later.
 pub struct Prefs {
     pub order: Vec<(Provider, bool)>,
@@ -13,6 +92,8 @@ pub struct Prefs {
     pub global_offset: f32,
     pub word_trim: f32,
     pub line_trim: f32,
+    /// How the sung words light up (see `Highlight`).
+    pub highlight: Highlight,
     /// "videoId|source" → offset.
     pub song_offsets: HashMap<String, f32>,
     /// videoId → source picked for that song.
@@ -76,12 +157,15 @@ impl Prefs {
             order.insert(at, (*p, true));
         }
         let num = |k: &str| get(k).and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+        let highlight = get("lyric_highlight").map(|v| Highlight::from_key(&v)).unwrap_or_default();
+        set_highlight_current(highlight);
         Self {
             order,
             target: get("lyric_lang").filter(|l| !l.is_empty()).unwrap_or_else(|| "en".into()),
             global_offset: num("lyric_offset"),
             word_trim: num("lyric_trim_word"),
             line_trim: num("lyric_trim_line"),
+            highlight,
             text_scale: get("lyric_scale").and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0).clamp(TEXT_SCALE.0, TEXT_SCALE.1),
             song_offsets: get("lyric_song_offsets").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
             pins: get("lyric_pins")
@@ -99,6 +183,7 @@ impl Prefs {
         storage.set_string("lyric_trim_word", format!("{:.1}", self.word_trim));
         storage.set_string("lyric_trim_line", format!("{:.1}", self.line_trim));
         storage.set_string("lyric_scale", format!("{:.2}", self.text_scale));
+        storage.set_string("lyric_highlight", self.highlight.key().to_owned());
         storage.set_string("lyric_song_offsets", serde_json::to_string(&self.song_offsets).unwrap_or_default());
         let pins: HashMap<&String, &str> = self.pins.iter().map(|(k, p)| (k, p.key())).collect();
         storage.set_string("lyric_pins", serde_json::to_string(&pins).unwrap_or_default());
@@ -138,6 +223,12 @@ impl Prefs {
         } else {
             self.song_offsets.insert(k, v);
         }
+    }
+
+    /// Change the highlight mode, keeping the renderer's live value in step.
+    pub fn set_highlight(&mut self, h: Highlight) {
+        self.highlight = h;
+        set_highlight_current(h);
     }
 
     /// Seconds to take off the clock for this song and source, as the extension does
@@ -257,6 +348,36 @@ mod tests {
         assert_eq!(at(&p), (2, 3));
         p.pick("v", &s, Provider::LrclibSynced);
         assert_eq!(at(&p), (3, 3));
+    }
+
+    #[test]
+    fn highlight_auto_follows_word_timing() {
+        use crate::preset::Fill;
+        // Automatic: word when the lyrics carry word timing, line when they don't.
+        // (`Fill` has no `Debug`, so compare with `matches!` instead of `assert_eq!`.)
+        assert!(matches!(Highlight::Auto.fill(true), Fill::Word));
+        assert!(matches!(Highlight::Auto.fill(false), Fill::Line));
+        // An explicit word pick on line-only lyrics falls back to the line.
+        assert!(matches!(Highlight::Word.fill(false), Fill::Line));
+        assert!(matches!(Highlight::Word.fill(true), Fill::Word));
+        assert!(matches!(Highlight::Line.fill(true), Fill::Line));
+        assert!(matches!(Highlight::Sweep.fill(true), Fill::Sweep));
+        assert_eq!(Highlight::from_key("word"), Highlight::Word);
+        assert_eq!(Highlight::from_key("bogus"), Highlight::Auto);
+    }
+
+    #[test]
+    fn highlight_round_trips_through_storage() {
+        let get = |k: &str| (k == "lyric_highlight").then(|| "line".to_owned());
+        let p = Prefs::load(&get);
+        assert_eq!(p.highlight, Highlight::Line);
+        assert_eq!(highlight_current(), Highlight::Line);
+        let mut p = Prefs::load(&|_| None);
+        assert_eq!(p.highlight, Highlight::Auto);
+        p.set_highlight(Highlight::Sweep);
+        assert_eq!(highlight_current(), Highlight::Sweep);
+        // Restore the default so other tests see it.
+        set_highlight_current(Highlight::Auto);
     }
 
     #[test]

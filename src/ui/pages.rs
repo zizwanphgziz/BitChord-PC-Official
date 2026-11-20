@@ -998,20 +998,15 @@ fn artist(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
 
 fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
     page_title(ui, "Library");
-    if !app.logged_in {
-        ui.add_space(10.0);
-        ui.label(RichText::new("Sign in to see your playlists, liked songs and history.").color(theme::text_dim()));
-        ui.add_space(12.0);
-        if pill(ui, "Sign in with Google", Some(icon::CIRCLE_USER), true).clicked() {
-            app.start_sign_in(ui.ctx());
-        }
-        return;
-    }
+    // Local files sit beside the YTM tabs but need no sign-in, so they come
+    // before the login gate below.
+    let local = local_tab(ui);
     ui.add_space(12.0);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
         for (t, label) in [(LibTab::Playlists, "Playlists"), (LibTab::Songs, "Liked songs"), (LibTab::Albums, "Albums"), (LibTab::History, "History"), (LibTab::Uploads, "Uploads")] {
-            if chip(ui, label, tab == t).clicked() {
+            if chip(ui, label, tab == t && !local).clicked() {
+                set_local_tab(ui, false);
                 // Tabs swap in place (no history entry); the current one refreshes.
                 if tab == t {
                     app.refresh();
@@ -1021,8 +1016,24 @@ fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
                 }
             }
         }
+        if chip(ui, "Local files", local).clicked() {
+            set_local_tab(ui, true);
+        }
     });
     ui.add_space(12.0);
+    if local {
+        local_library(app, ui, now);
+        return;
+    }
+    if !app.logged_in {
+        ui.add_space(10.0);
+        ui.label(RichText::new("Sign in to see your playlists, liked songs and history.").color(theme::text_dim()));
+        ui.add_space(12.0);
+        if pill(ui, "Sign in with Google", Some(icon::CIRCLE_USER), true).clicked() {
+            app.start_sign_in(ui.ctx());
+        }
+        return;
+    }
     let grid = |ui: &mut Ui, cards: &[Card], acts: &mut Vec<Action>| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(20.0, 22.0);
@@ -1114,6 +1125,76 @@ fn library(app: &mut App, ui: &mut Ui, tab: LibTab, now: f64) {
             }
         }
     }
+}
+
+/// Whether the Library page is showing local files instead of a YTM tab.
+/// Kept in egui's temp data (it is view state, not a setting); picking a YTM
+/// tab clears it again.
+fn local_tab(ui: &Ui) -> bool {
+    ui.data(|d| d.get_temp::<bool>(egui::Id::unique("local-lib-tab"))).unwrap_or(false)
+}
+
+fn set_local_tab(ui: &Ui, open: bool) {
+    ui.data_mut(|d| d.insert_temp(egui::Id::unique("local-lib-tab"), open));
+}
+
+/// Local files on this computer: folders picked here, scanned for audio.
+/// Needs no sign-in and never touches the YTM library; songs play from disk
+/// (see `locallib::open` and the backend stream hook).
+fn local_library(app: &mut App, ui: &mut Ui, now: f64) {
+    let folders = crate::locallib::folders();
+    ui.horizontal(|ui| {
+        if pill(ui, "Add folder", Some(icon::FOLDER_OPEN), true).clicked() {
+            crate::locallib::pick_folder(ui.ctx());
+        }
+        if pill(ui, "Rescan", None, false).clicked() {
+            crate::locallib::rescan();
+        }
+    });
+    ui.add_space(6.0);
+    ui.label(RichText::new("Music files on this computer. FLAC, MP3, M4A, AAC, OGG and WAV.").font(theme::regular(13.0)).color(theme::text_dim()));
+    ui.add_space(12.0);
+    let mut remove: Option<std::path::PathBuf> = None;
+    for f in &folders {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(f.display().to_string()).font(theme::regular(13.5)).color(theme::text()));
+            if pill(ui, "Remove", Some(icon::X), false).clicked() {
+                remove = Some(f.clone());
+            }
+        });
+        ui.add_space(4.0);
+    }
+    if let Some(f) = remove {
+        crate::locallib::remove_folder(&f);
+    }
+    if folders.is_empty() {
+        ui.add_space(20.0);
+        ui.label(RichText::new("No folders yet").font(theme::semibold(16.0)).color(theme::text()));
+        ui.add_space(4.0);
+        ui.label(RichText::new("Add a folder to scan it for music. Your files stay where they are.").font(theme::regular(13.0)).color(theme::text_dim()));
+        return;
+    }
+    let tracks = crate::locallib::tracks();
+    ui.add_space(8.0);
+    if tracks.is_empty() {
+        ui.label(RichText::new("No audio files found in these folders.").color(theme::text_dim()));
+        return;
+    }
+    ui.horizontal(|ui| {
+        if pill(ui, "Play", Some(icon::PLAY), true).clicked() {
+            app.actions.push(Action::Play(tracks.clone(), 0));
+        }
+        if pill(ui, "Shuffle", Some(icon::SHUFFLE), false).clicked() {
+            let mut t = tracks.clone();
+            super::shuffle(&mut t);
+            app.actions.push(Action::Play(t, 0));
+        }
+        ui.label(RichText::new(format!("{} songs", tracks.len())).font(theme::regular(13.0)).color(theme::text_dim()));
+    });
+    ui.add_space(12.0);
+    let rows = Rows::new(app, now);
+    let plain = |_: usize, _: &Track| None;
+    list(ui, &rows, &app.liked, &tracks, true, plain, ListCtx { sel: &mut app.selection, page: &app.page, own: false }, &mut app.actions);
 }
 
 // ------------------------------------------------------------------ downloads
@@ -1431,6 +1512,20 @@ fn settings_playback(app: &mut App, ui: &mut Ui) {
             output_device_picker(app, ui);
         });
         divider(ui);
+        setting_row(ui, "Output sample rate", Some("The rate the mixer runs at. Pick the rate your DAC natively takes and hi-res tracks reach it without resampling. Needs a restart to take effect."), |ui| {
+            output_rate_picker(app, ui);
+        });
+        if app.audio.sample_rate_pref() != app.audio.sample_rate_active() {
+            divider(ui);
+            let mut restart = false;
+            setting_row(ui, "Restart to apply", Some("The mixer runs at the new rate from the next start."), |ui| {
+                restart = pill(ui, "Restart now", None, true).clicked();
+            });
+            if restart {
+                app.restart(ui.ctx());
+            }
+        }
+        divider(ui);
         setting_row(ui, "Automix", Some("Slide from one song into the next the way a DJ would: both hold their level for a moment, then swap in one smooth move, instead of a straight fade. The mix picks its own length, in phrases of 8 or 16 bars (16 on long songs), following the beat it hears."), |ui| {
             if toggle(ui, &mut app.automix, "Automix").changed() {
                 app.set_crossfade();
@@ -1473,6 +1568,21 @@ fn settings_playback(app: &mut App, ui: &mut Ui) {
                 app.backend.set_disable_direct_stream(app.disable_direct_stream);
             }
         });
+        setting_row(ui, "Auto-upgrade quality", Some("When a song starts on YouTube audio, keep looking for its hi-res copy in the background and switch to it when it arrives. Off: hi-res is only used when you ask for it."), |ui| {
+            let mut on = app.backend.auto_upgrade();
+            if toggle(ui, &mut on, "Auto-upgrade quality").changed() {
+                app.backend.set_auto_upgrade(on);
+            }
+        });
+        divider(ui);
+        setting_row(ui, "Sleep timer", Some("Pause playback after a while, or when the current song ends. The music keeps playing until then — the app never quits."), |_| {});
+        ui.add_space(12.0);
+        sleep_timer_editor(app, ui);
+        ui.add_space(10.0);
+        divider(ui);
+        setting_row(ui, "Playback speed", Some("How fast songs play, 0.5× to 2×. The pitch rises with the tempo — the samples play faster, they aren't time-stretched — and it applies to the song playing now, and to the ones after it."), |ui| {
+            speed_row(app, ui);
+        });
     });
 }
 
@@ -1492,6 +1602,10 @@ fn hires_sources_editor(app: &mut App, ui: &mut Ui) {
         ui.allocate_ui_with_layout(vec2(ui.available_width(), 42.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if widgets::icon_button(ui, icon::X, 14.0, "Remove source", false).clicked() {
                 remove = Some(i);
+            }
+            ui.add_space(8.0);
+            if pill(ui, "Test", None, false).clicked() {
+                app.hires_retest(&link);
             }
             ui.add_space(8.0);
             if super::text_field(ui, "", &mut app.hires_sources[i], false, "https://your-addon.example").changed() {
@@ -1623,6 +1737,23 @@ fn settings_lyrics(app: &mut App, ui: &mut Ui) {
             }
         });
         divider(ui);
+        setting_row(ui, "Highlight", Some("How the sung words light up. Automatic lights each word when the lyrics have word timing, and the whole line when they only have line timing."), |ui| {
+            let current = app.lyric_prefs.highlight.label();
+            let btn = dropdown_button(ui, current, 160.0, "Highlight");
+            egui::Popup::menu(&btn).show(|ui| {
+                ui.set_width(160.0);
+                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                ui.add_space(4.0);
+                for h in super::lyric_prefs::Highlight::ALL {
+                    if option_row(ui, h.label(), h == app.lyric_prefs.highlight).clicked() {
+                        app.lyric_prefs.set_highlight(h);
+                        ui.close();
+                    }
+                }
+                ui.add_space(4.0);
+            });
+        });
+        divider(ui);
         // Offsets: seconds taken off the lyrics clock, as the extension's dock sets them.
         for (title, desc, which) in [
             ("Timing offset", "Shift all lyrics later (+) or earlier (−).", 0),
@@ -1728,6 +1859,14 @@ fn settings_appearance(app: &mut App, ui: &mut Ui) {
         divider(ui);
         setting_row(ui, "Animated background", Some("The album art slowly drifts behind everything."), |ui| {
             toggle(ui, &mut app.anim_bg, "Animated background");
+        });
+        divider(ui);
+        setting_row(ui, "Dynamic theme from artwork", Some("Take the accent colour (highlights, progress bar, now-playing background tint) from the current cover art. Off, the default accent is used instead."), |ui| {
+            let mut on = theme::dynamic_theme();
+            toggle(ui, &mut on, "Dynamic theme from artwork");
+            if on != theme::dynamic_theme() {
+                theme::set_dynamic_theme(on);
+            }
         });
         divider(ui);
         setting_row(ui, "Pulse with the music", Some("The background swells with the beat."), |ui| {
@@ -1836,6 +1975,45 @@ fn settings_connections(app: &mut App, ui: &mut Ui) {
         if disconnect {
             app.lastfm_sign_out();
         }
+        divider(ui);
+        // ListenBrainz scrobbles the same plays as Last.fm, to a different profile.
+        // The toggle and token live in the ListenBrainz module (its own vault entry
+        // and enabled file), the way Last.fm's session lives in `lastfm.rs`.
+        let lb_on = crate::listenbrainz::enabled();
+        setting_row(ui, "ListenBrainz", Some("Scrobble what you play to your ListenBrainz profile, the same way as Last.fm."), |ui| {
+            let mut on = lb_on;
+            if toggle(ui, &mut on, "ListenBrainz").changed() {
+                crate::listenbrainz::set_enabled(on);
+            }
+        });
+        if lb_on {
+            divider(ui);
+            setting_row(ui, "User token", Some("From listenbrainz.org: your profile page, under \"API token\". Kept in the app vault, like Last.fm's sign-in."), |ui| {
+                let mut token = crate::listenbrainz::token().unwrap_or_default();
+                let before = token.clone();
+                masked_settings_field(ui, &mut token, "Paste your user token", 128);
+                if token != before {
+                    crate::listenbrainz::set_token(&token);
+                }
+            });
+            divider(ui);
+            let busy = crate::listenbrainz::test_busy();
+            setting_row(ui, "Test connection", Some("Check the token against ListenBrainz."), |ui| {
+                if busy {
+                    ui.spinner();
+                } else if pill(ui, "Test", None, false).clicked() {
+                    app.listenbrainz_test();
+                }
+            });
+            if let Some(r) = crate::listenbrainz::peek_test_result() {
+                let (text, colour) = match r {
+                    Ok(name) => (format!("Token is valid for {name}."), theme::text_dim()),
+                    Err(e) => (e, theme::RED),
+                };
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(text).font(theme::regular(11.5)).color(colour));
+            }
+        }
     });
     if discord_enabled != app.discord_enabled {
         app.set_discord_enabled(discord_enabled);
@@ -1901,6 +2079,24 @@ pub(super) fn settings_field(ui: &mut Ui, text: &mut String, hint: &str, limit: 
         egui::TextEdit::singleline(text)
             .hint_text(egui::RichText::new(hint).color(theme::text_faint()))
             .font(theme::regular(14.0))
+            .char_limit(limit)
+            .frame(egui::Frame::NONE)
+            .align(egui::Align2::LEFT_CENTER)
+            .desired_width(inner.width()),
+    );
+}
+
+/// The same field, hiding what is typed: for the ListenBrainz user token.
+fn masked_settings_field(ui: &mut Ui, text: &mut String, hint: &str, limit: usize) {
+    let (rect, _) = ui.allocate_exact_size(vec2(200.0, 36.0), Sense::hover());
+    ui.painter().rect_filled(rect, 10.0, theme::glass(0.08));
+    let inner = rect.shrink2(vec2(12.0, 4.0));
+    ui.put(
+        inner,
+        egui::TextEdit::singleline(text)
+            .hint_text(egui::RichText::new(hint).color(theme::text_faint()))
+            .font(theme::regular(14.0))
+            .password(true)
             .char_limit(limit)
             .frame(egui::Frame::NONE)
             .align(egui::Align2::LEFT_CENTER)
@@ -2186,6 +2382,105 @@ fn output_device_picker(app: &mut App, ui: &mut Ui) {
         app.audio.send(crate::audio::AudioCmd::SetDevice(pick.as_ref().map(|(id, _)| id.clone())));
         app.output_device = pick;
     }
+}
+
+/// The sleep timer's presets and countdown, under the Settings › Playback row.
+fn sleep_timer_editor(app: &mut App, ui: &mut Ui) {
+    use crate::sleep_timer::{self, Mode};
+    match sleep_timer::mode() {
+        Mode::Minutes { .. } => {
+            // The countdown ticks: ask for a repaint every second while it runs.
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+            ui.horizontal(|ui| {
+                let left = sleep_timer::remaining_label().unwrap_or_else(|| "less than a minute left".to_owned());
+                ui.label(egui::RichText::new(format!("Sleeping in {left}")).font(theme::regular(14.0)).color(theme::text()));
+                ui.add_space(8.0);
+                if pill(ui, "Cancel", None, false).clicked() {
+                    sleep_timer::cancel();
+                }
+            });
+        }
+        Mode::AfterTrack => {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Stops when this song ends").font(theme::regular(14.0)).color(theme::text()));
+                ui.add_space(8.0);
+                if pill(ui, "Cancel", None, false).clicked() {
+                    sleep_timer::cancel();
+                }
+            });
+        }
+        Mode::Off => {
+            ui.horizontal(|ui| {
+                let last = sleep_timer::last_preset();
+                for minutes in sleep_timer::PRESETS_MIN {
+                    if pill(ui, &format!("{minutes} min"), None, minutes == last).clicked() {
+                        sleep_timer::set_minutes(minutes);
+                    }
+                    ui.add_space(6.0);
+                }
+                if pill(ui, "After this track", None, false).clicked() {
+                    sleep_timer::set_after_track();
+                }
+            });
+            // Pausing from here is a guess at nothing: the timer needs a song playing.
+            if !app.playing() {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Start a song first — a timer set with nothing playing waits for one.").font(theme::regular(12.0)).color(theme::text_faint()));
+            }
+        }
+    }
+}
+
+/// The playback-speed presets, in the Settings › Playback row's control slot.
+fn speed_row(app: &mut App, ui: &mut Ui) {
+    let current = app.speed();
+    ui.horizontal(|ui| {
+        for p in crate::audio::SPEED_PRESETS {
+            let label = format!("{}×", if p == p.trunc() { format!("{:.0}", p) } else { format!("{p}") });
+            if pill(ui, &label, None, (p - current).abs() < 0.01).clicked() {
+                app.set_speed(p);
+            }
+            ui.add_space(4.0);
+        }
+    });
+}
+
+/// The output sample rate picker, next to the output device picker: the device's
+/// default, or one of the rates the picked (or default) device offers.
+fn output_rate_picker(app: &mut App, ui: &mut Ui) {
+    const DEVICE_DEFAULT: &str = "Device default";
+    let current = match app.audio.sample_rate_pref() {
+        Some(rate) => fmt_rate_khz(rate),
+        None => DEVICE_DEFAULT.to_owned(),
+    };
+    let btn = dropdown_button(ui, &current, 150.0, "Output sample rate");
+    let mut pick: Option<Option<u32>> = None;
+    egui::Popup::menu(&btn).show(|ui| {
+        ui.set_width(220.0);
+        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+        ui.add_space(4.0);
+        if option_row(ui, DEVICE_DEFAULT, app.audio.sample_rate_pref().is_none()).clicked() {
+            pick = Some(None);
+            ui.close();
+        }
+        let device = app.output_device.as_ref().map(|(id, _)| id.as_str());
+        for rate in crate::audio::supported_rates(device) {
+            if option_row(ui, &fmt_rate_khz(rate), app.audio.sample_rate_pref() == Some(rate)).clicked() {
+                pick = Some(Some(rate));
+                ui.close();
+            }
+        }
+        ui.add_space(4.0);
+    });
+    if let Some(pick) = pick {
+        app.audio.set_sample_rate_pref(pick);
+    }
+}
+
+/// A sample rate as the picker shows it ("48 kHz", "44.1 kHz"): the same shape
+/// as the hi-res badge's `fmt_khz`.
+fn fmt_rate_khz(hz: u32) -> String {
+    if hz.is_multiple_of(1000) { format!("{} kHz", hz / 1000) } else { format!("{:.1} kHz", hz as f64 / 1000.0) }
 }
 
 /// A dropdown's closed state: the chosen value and a chevron on a glass pill.
